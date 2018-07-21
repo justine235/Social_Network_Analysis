@@ -1,0 +1,752 @@
+---
+title: "Social Network Analysis"
+author: "Charley Justine"
+date: "20 mai 2018"
+output: html_document
+---
+
+Ce rapport a pour objectif de comprendre les interactions sociales nouer entre les différents types d’acteurs. 
+Plusieurs modules dédiés à l’analyse des réseaux seront utilisés tels que : igraph, ergm, SNA.
+
+Nos données proviennent des « Bahamas Leaks », révélant un continuum d’informations sur des sociétés offshore, enregistré aux Bahamas entre 1959 et 2006. Le voile est levé quant à l’identité des administrateurs et détenteurs de ces sociétés, et nous allons rentrer au cœur de ce réseau.
+
+Nous tenterons de répondre à diverses problématiques telles que la mise en relief des acteurs centraux du réseau. Par qui, ces comptes off-shore peuvent exister. Quels sont les acteurs qui entretiennent des liens forts c’est-à-dire à forte fréquence de connexions. Et pour finir, quelles sont les relations au sein de ce réseau pour comprendre leurs structures et leurs comportements.
+
+Dans la première partie, nous commencerons par une présentation des bases de données utilisées, les différents traitements qui ont été appliqués ainsi qu’une présentation d’un ensemble de réseaux brutes.
+Dans la seconde partie, l’objectif sera de construire un partitionnement des nœuds par différents algorithmes de clustering.
+
+  
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# _____________________________  O - ENVIRONNEMENT + IMPORTATION  _______________________________ #
+
+libs <- c("tidyverse", "data.table", "igraph", "quantmod", "highcharter", "sna", "tm",
+          "wordcloud", "ggnet", "tidyverse")
+lapply(libs, library, character.only = TRUE)
+options(encoding = "UTF-8")
+
+
+setwd("C:/Users/charl/Desktop/Analyse des reseaux sociaux/projet/data")
+EDGES <- fread("bahamas_leaks.edges.csv", na.strings = c("NA", "", " "))
+ADDRESS <- fread("bahamas_leaks.nodes.address.csv", na.strings = c("NA", "", " "))
+ENTITY <- fread("bahamas_leaks.nodes.entity.csv", na.strings = c("NA", "", " "))
+INTERMED <- fread("bahamas_leaks.nodes.intermediary.csv", na.strings = c("NA", "", " "))
+OFFICER <- fread("bahamas_leaks.nodes.officer.csv", na.strings = c("NA", "", " "))
+
+# Remarque : Usuellement, on a recours à une sortie en RMarkDown. 
+# Cependant, pour des soucis de lenteur du code, j'ai décidé de faire un export
+# de chacune des sorties et d'écrire le rapport dans un second temps.
+# Chacune des parties ci-dessous respectent strictement le déroulement du rapport.
+
+# j'utilise set.seed afin de garder l'aléatoire "reproductible"
+set.seed(1994)
+```
+
+Section I -  A la découverte des “Bahamas Leaks”
+
+Nous possédons un ensemble de 5 bases de données :
+1.	ADDRESS comportant 551 nœuds ainsi que les adresses pour chacun.
+2.	ENTITY comportant 175.888 nœuds, le nom de l’entité, sa juridiction accompagnée de la date d’enregistrement.
+3.	INTERMEDIARY comportant 541 nœuds, leur nom et les pays de référencement.
+4.	OFFICER avec 25.262 nœuds et leur nom.
+5.	EDGES comportent un ensemble de 249.190 connexions et le type de relations.
+
+Le nom EDGES, ne nous donne aucune information sur le type de connexions (orienté ou non). Cependant, à travers la variable rel_type, il est aisé de comprendre la nature des liens entre les différents acteurs.
+
+Les arcs: “intermediary_of” / “officer_of”
+Les arêtes: “probably_same_officer_as” / “registered_address” / “same_address_as” / “same_company_as” / “same_intermediary_as” / “same_name_as”/ “similar_company_as” 
+
+Cette caractérisation est intuitive car la préposition OF démontre bien une connexion dirigée par la notion induite : FROM & TO ce qui en font des arcs. Au contraire, la préposition « same as » implique une réciprocité dans la connexion, ce sont donc des arêtes.
+
+Intéressons-nous aux ordres de grandes des différents types de relation au sein de notre table EDGES.
+
+```{r cars,echo = FALSE,warning = FALSE, fig.align="center" }
+# _______________________ Section 1 : A la découverte des “Bahamas Leaks” __________________ #
+
+# ------------------------------ 0 ) presentation des bases ----------------------------------
+# passage en factor
+EDGES$rel_type <- as.factor(EDGES$rel_type)
+levels(EDGES$rel_type)
+#  ==> 9 types de relations  
+
+# nombre de noeuds par type de relation
+t <- EDGES %>% select(rel_type) %>% group_by(rel_type) %>% 
+  summarize(n = n()) %>% 
+  arrange(desc(n))
+
+# pour organiser l'ordre de x_axis
+t$rel_type <- as.character(t$rel_type )
+t$rel_type <- factor(t$rel_type, levels = unique(t$rel_type))
+
+# Remarque : je fixe donc volontairement mon echelle à 40.000 par intermediary ont 175.876 relations, 
+ggplot(data = t, aes(x = rel_type, y = n, fill = n)) + geom_bar(stat = "identity", alpha = 0.6) +
+  theme_minimal() + coord_cartesian(ylim = c(0, 40000)) +
+  theme(axis.text.x = element_text(size = 11, angle = 45,hjust = 1)) +
+  geom_text(aes(label = n), vjust = 8, color = "white", size = 3)
+
+```
+
+Il est à noter que les types de connexions sont reparties de manière inégale dans la liste des edges.
+
+
+1 ) Pré-processing / Cleaning des data
+
+Dans cette sous-section, je vous présenterais les différents traitements appliqués afin de faciliter la manipulation des données.
+
+•	Un certain nombre de variables ont été retirées sur chacune des bases
+•	Ajout d’une colonne supplémentaire dans la table EDGES prenant 2 modalités : « Directed » ou « Undirected » selon le type de relation énoncé ci-dessus. De même, deux nouvelles tables ont été construites : EDGES_DIRECTED et EDGES_UNDIRECTED.
+•	Transformation de la date au format « date ».
+•	Création d’une nouvelle table NODES qui regroupe tous les nodes_id de toutes les bases de données.
+•	Suppression de tous les nœuds présents dans la table EDGES qui ne sont pas présent dans la table NODES (nécessaire pour éviter une erreur d’exécution durant la construction de l’objet igraph).
+
+
+```{r pressure,include = FALSE}
+# --------------------------------- 1.1 ) PREPROCESSING ----------------------------------------
+
+#°°°°°°°°°  1/ je retire les colonnes vides ou inutiles puis les renommes
+ADDRESS <- ADDRESS[, c(1,3,4,5,6,7,18)]
+ENTITY <- ENTITY[, c(1,5,6,8,9,11,13,14,18)]
+OFFICER <- OFFICER[, c(1,3,4,5,6,8,18)]
+INTERMED <- INTERMED[, c(1,3,4,5,6,8,18)]
+
+colnames(ADDRESS) <- c("label", "country_codes", "countries", "node_id", "sourceID","name","note")
+colnames(OFFICER)<- c("label", "country_codes", "countries", "node_id", "sourceID","name","note")
+colnames(INTERMED)<- c("label", "country_codes", "countries", "node_id", "sourceID","name","note")
+colnames(ENTITY) <- c("label", "node_id" , "sourceID_EN" , "name", "jurisdiction_description","jurisdiction","incorporation_date","ibcRUC","note")      
+
+
+
+#°°°°°°°°°  2/ Colonne supplémentaire sur EDGES comportant "Directed' ou "Undirected'
+EDGES_DIRECTED <- EDGES %>% filter(rel_type == "intermediary_of" | rel_type == "officer_of" ) %>% 
+  mutate(type ="Directed")
+
+EDGES_UNDIRECTED <- EDGES %>% filter(rel_type == "probably_same_officer_as" |
+                                       rel_type == "registered_address" |
+                                       rel_type == "same_address_as" |
+                                       rel_type == "same_company_as" |
+                                       rel_type == "same_intermediary_as" |
+                                       rel_type == "same_name_as" |
+                                       rel_type == "similar_company_as" ) %>% 
+                              mutate(type ="Undirected")
+
+# rassemblement des 2 bases
+EDGES <- rbind(EDGES_DIRECTED,EDGES_UNDIRECTED)
+
+
+
+#°°°°°°°°° 3/ TRANSFORMATION AU FORMAT DATE 
+Sys.setlocale("LC_TIME", "ENGLISH")
+ENTITY$incorporation_date <- as.POSIXct(strptime(ENTITY$incorporation_date, format = "%d-%b-%Y"))
+ENTITY$incorporation_date <- as.Date(ENTITY$incorporation_date)
+
+# extraction de l'année
+ENTITY$year_date <- year(ENTITY$incorporation_date)                          
+
+
+
+#°°°°°°°°° 4/ CREATION d'un DF composant tous les noeuds des différentes tables
+NODES <- rbind(ENTITY[,c(1,2,4)], OFFICER[,c(1,4,6)],
+               INTERMED[,c(1,4,6)], ADDRESS[,c(1,4,6)])
+
+length(unique(as.factor(ENTITY$name))) 
+length(unique(as.factor(OFFICER$node_id))) 
+length(unique(as.factor(INTERMED$node_id))) 
+
+
+#°°°°°°°°° 5/ remove nodes IN EDGES qui ne sont pas présent dans la table NODES
+NODES_vector <- unique(NODES$node_id)
+EDGES <- subset(EDGES, node_1 %in% NODES_vector) %>% select(node_1, node_2, rel_type) 
+EDGES <- subset(EDGES, node_2 %in% NODES_vector) %>% select(node_1, node_2, rel_type) 
+
+
+```
+
+
+
+2 ) Visualisation 
+
+Nous possédons un sous-ensemble d’informations concernant les entités dont leurs dates d’enregistrements.
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+# --------------------------------- 1.2 ) Visualisation ---------------------------------------
+
+#°°°°°°°°°  Evolution temporelle de la date de création d'une entité
+t <- ENTITY %>% select(year_date) %>% group_by(year_date) %>% summarize(n = n())
+
+ggplot(t, aes(x = year_date, y = n, fill = n)) + 
+  geom_bar(stat = "identity") +
+  theme_minimal() + 
+  coord_cartesian(xlim = c(1925, 2020)) + 
+  ggtitle("Repartition des entités par date de constitution")
+
+```
+
+Au vu de ce graphique, on peut se demander, s’il n’y aurait pas un manque d’informatisation et/ou de renseignements. En effet, seule une très infime partie des dates sont renseignées entre 1954 et 1980. 
+
+En outre, les dernières années de la décennie 90 ont été beaucoup plus riches en enregistrement que les autres. Plusieurs hypothèses sont envisageables comme le scénario de la crise Économique ou encore de nouvelles lois renforçant la fiscalité.
+
+
+
+  D’autre part, nous possédons le pays de recensement pour tous les types de statuts : Officer, Entité, et Intermédiaire.
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+
+#°°°°°°°°° Nationalité par type de status 
+Countries_off <- OFFICER %>% group_by(countries) %>% count() %>% na.omit() %>% 
+  arrange(desc(n)) %>% head(8)
+Countries_add <- ADDRESS %>% group_by(countries) %>% count() %>% na.omit() %>% 
+  arrange(desc(n)) %>% head(8)
+Countries_int <- INTERMED %>% group_by(countries) %>% count() %>% na.omit() %>% 
+  arrange(desc(n)) %>% head(8)
+
+Countries_off$Type <- "OFFICER"
+Countries_add$Type <- "ADDRESS"
+Countries_int$Type <- "INTERMED"
+Countries <- rbind(Countries_off,Countries_int,Countries_add)
+
+# pour voir apparaitre les autres pays , on est obligé de fixé une echelle à 150 max
+ggplot(data = Countries, aes(x = countries, y = n, fill = Type)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() + coord_cartesian(ylim = c(0, 150)) +
+  theme(axis.text.x = element_text(size = 11, angle = 45,hjust = 1)) +
+  geom_text(aes(label = n), vjust = -0.25, color = "black", size = 3.5) +
+  scale_fill_manual(values = c("#CCFF33", "#FF6633","#99CCFF" )) +
+  ggtitle('Pays de recensement par status')
+# ==> Les addresses officer sont majoritairement recensée au Bahamas, Spain, United States
+
+
+```
+
+Remarque : Dans un souci d’affichage, l’échelle du graphique en ordonnée a été fixée à 150.
+Répartition pour les Bahamas : 539 intermédiaires, 530 adresses récences.
+
+Autre que les Bahamas, les pays comme l’Espagne ou les Etats-Unis sont fortement représentés.
+
+
+Avant même d’étudier les liens et points communs entre les entités, nous remarquons aisément que les noms de ces entités se ressemblent énormément.
+Afin de confirmer cette intuition, un nuage de mot sur les noms des entités est réalisé.
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+
+
+#°°°°°°°°°  Similar names of ENTITY 
+corpus <- ENTITY$name %>% VectorSource() %>%  VCorpus()
+
+wordcloud(words = corpus, min.freq = 2, max.words = 50, random.order = FALSE, rot.per = 0.35, 
+          colors = brewer.pal(8, "Dark2"))
+#==> En effet ltd / Limited revient le plus souvent
+```
+
+
+3 ) Réseaux simples
+
+ Afin de faciliter la compréhension et l’utilisation des bases de données, nous allons représenter les liens pour une entité donnée puis pour un intermédiaire donné.
+
+
+Exemple 1 : Les interactions de la société : K A & A Management Limited (id : 20164292) créé en 2012.
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+# -------------------------------- 1.3 ) Réseaux simples ---------------------------------------
+# ==> EXEMPLE ayant pour but de faciliter la COMPREHENSION  
+
+
+#°°°°°°°°°°°°°°°°°°°°°°°°°°° Exemple 1 ENTITY °°°°°°°°°°°°°°°°°°°°°°°°°°°#
+
+# => exemple: node_id : 20164292
+Links <- EDGES  %>% filter(node_2 == "20164292")
+Links_vector <- unique(c( Links$node_1, Links$node_2 ))
+
+#je ne gardes que les noeuds qui sont présents dans les edges filtrées pour alleger la base
+nodes <- subset(NODES, node_id %in% Links_vector) %>% select(node_id, name, label)
+
+# passage en object igraph
+net_ex1 <- graph_from_data_frame(d = Links, vertices = nodes, directed = TRUE) 
+
+plot(net_ex1, remove.loops = T, remove.multiple = F, 
+     edge.arrow.size = .4, edge.color = "black",   #edge  
+     edge.label = Links$rel_type, edge.label.color = "grey",
+     vertex.color = "tomato", vertex.label = nodes$name, vertex.label.dist = 1) #vertex    
+
+# ==> on peut imager que plusieurs types de "statut moral" au sein de la table "OFFICER"
+
+```
+
+L’entité K A & A Management Limited est connecté à 3 arcs de type « officer of » dont 2 provenant au nom de « Octagon Management Limited ». 
+
+Concernant la structure de la base « Officer », on peut émettre l’hypothèse qu’il existe plusieurs fonctions / statuts au sein de la table. 
+
+L’intermédiaire de cette entité est le « Credit Suisse Trust Limited ». Cette banque est grandement impliquée dans la création de société écran mais ne fut pas l’objet de poursuites judiciaires.
+
+
+Exemple 2 : Les interactions de l’intermédiaire : MICHAEL A. DEAN (id : 23000265).
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+
+#°°°°°°°°°°°°°°°°°°°°°°°°°°° Exemple 2 INTERMEDIARY °°°°°°°°°°°°°°°°°°°°°°°°°°°#
+
+Links <- EDGES %>% select(node_1, node_2, rel_type) %>% filter(node_1 == "23000265")
+Links_vector <- unique(c( Links$node_1, Links$node_2 ))
+
+nodes <- subset(NODES, node_id %in% Links_vector) %>% select(node_id, name, label)
+
+net_ex2 <- graph_from_data_frame(d = Links, vertices = nodes, directed = TRUE) 
+
+#==> 6 intéractions : 5 entities + 1 adress
+plot(net_ex2, remove.loops = T, remove.multiple = F, 
+     edge.arrow.size = .4, edge.color = "black", edge.label.color = "grey",edge.label = Links$rel_type,
+     vertex.color = "tomato", vertex.label = nodes$name, vertex.label.dist = 1) 
+
+# Il est intérmediaire de 5 entity différentes et l'on a son adresse de recensement 
+
+```
+
+Nous avons 6 interactions enregistrées pour ce cabinet d’avocats. La première est son adresse de recensement aux Bahamas. Tandis que les 5 autres, sont les entités qu’ils ont administrées.
+
+
+4 ) Réseaux globaux
+
+Désormais, nous pouvons observer des réseaux d’une manière plus globale, sans forcément se concentrer sur un nœud en particulier.
+
+Afin de faciliter la lecture des graphiques suivants, un code couleur a été appliqué selon le statut du nœud.
+
+
+	Officer :rouge  
+	Intermediaries:bleu 
+	Autres:jaune
+
+4.1 )  Tirage de 150 connexions orientées (arcs)
+
+Dans le réseau suivant, nous avons 150 arcs avec 233 nœuds uniques. Un calcul de degré a été préalablement calculé par la fonction degree. 
+Pour rappel, le degré d’un nœud correspond à son nombre de connexions. 
+
+Sur ce réseau, on remarque que les intermédiaires (nœuds bleus) ont un nombre de connexions qui se démarquent, bien que nous soyons dans un cadre de « sous réseaux » et donc en sous-estimations des degrés.
+
+L’explication se trouve dans leurs rôles, en effet ils sont les commanditaires à la création des sociétés écrans, et ont donc un rôle central qui se retrouve dans le réseau.
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+#°°°°°°°°°°°°°°°°° i) Extrait de 150 connexions orientés aléatoires 
+
+Links <- EDGES_DIRECTED[sample(1:nrow(EDGES_DIRECTED), 150, replace = FALSE), ] %>% 
+        select(node_1, node_2, rel_type)
+Links_vector <- unique(c(Links$node_1, Links$node_2))
+
+# ce filtrage permet de réduire la taille de la table nodes et donc gagner en dimension
+nodes <- subset(NODES,node_id %in% Links_vector) %>% select(node_id, name, label)
+
+#nodes_vector <-  unique(c(nodes$node_id))
+#Links <- subset(Links, node_1 %in% nodes_vector) %>% select(node_1, node_2, rel_type)
+#Links <- subset(Links, node_2 %in% nodes_vector) %>% select(node_1, node_2, rel_type)
+
+net_1 <- graph_from_data_frame(d = Links, vertices = nodes, directed = TRUE) 
+
+
+# INFORMATIONS DE BASES #
+#vcount(net_1) # nombre de vertex 
+#ecount(net_1) # nombre de edge 
+#E(net_1)$rel_type 
+#V(net_1)$name 
+#V(net_1)$label
+clusters <- clusters(net_1) # nb composantes connexes 
+
+
+# pour faciliter la lecture, je décide de mettre de la couleurs par type de vertex 
+V(net_1)$color <- ifelse(V(net_1)$label ==  "[\"\"Officer\"\"]" ,   "tomato",
+                         ifelse(V(net_1)$label == "[\"\"Intermediary\"\"]", "blue", 
+                                "gold"))
+
+# permet de mesurer les degrees pour ponderer la taille des noeuds
+totaldegreeG <- igraph::degree(net_1, mode = "all")
+
+# 2 figures - 1 rows, 2 columns
+par(mfrow = c(1,2), mar = c(0,0,0,0)) 
+
+l <- layout_with_lgl(net_1) #large network layout
+V(net_1)$size <- totaldegreeG
+plot(net_1,
+     edge.arrow.size = 0.3, edge.color = "grey",edge.curved = .4,
+     vertex.color = V(net_1)$color, vertex.label = NA, vertex.label.dist = 1,
+     layout = l)
+
+l <- layout_in_circle(net_1) # display in circle
+plot(net_1, 
+     edge.arrow.size = 0.3, edge.color="grey", edge.curved = .4,
+     vertex.color=V(net_1)$color, vertex.label = NA, vertex.label.dist = 1,
+     layout = l)
+
+```
+
+
+La fonction clusters de Igraph permet de mettre en évidence 83 composantes connexes, on  suppose donc que les composantes ne sont pas de très grandes tailles.
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+# meme chose mais avec une couleur par composantes connexes
+
+l <- layout_with_lgl(net_1)
+plot(net_1, 
+     edge.color = "grey",edge.curved = .4, edge.arrow.size = 0.3,
+     vertex.color = clusters$membership, vertex.label = NA, vertex.label.dist = 1,
+     layout = l)
+```
+
+Sur le graphique, les couleurs des nœuds correspondent aux composantes connexes. A ce stade, il est difficile de tirer des conclusions supplémentaires.
+
+
+4.2 )  Tirage aléatoires de 10 intermédiaires (arcs)
+
+Le tirage de 10 nœuds aléatoire m’a permis d’obtenir un ensemble de 1989 nœuds reliés à 1979 connexions.
+On passe par un tirage aléatoire une seconde fois pour assurer une lisibilité sur le graphique.
+
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+#°°°°°°°°°°°°°°°°° ii) Les rôles des INTERMEDAIRES - orientés - 10 intermédiaires aléatoires
+INTERMED1 <- INTERMED[sample(1:nrow(INTERMED), 10, replace = FALSE), ]
+vector_intermed <- unique(INTERMED1$node_id)
+
+Links <- subset(EDGES, node_1 %in% vector_intermed) %>% select(node_1, node_2, rel_type)
+Links_vector <- unique(c(Links$node_1, Links$node_2))
+
+nodes <- subset(NODES, node_id %in% Links_vector) %>% select(node_id, name, label)
+
+#je ne garde que les noms des intermédaires dans la table nodes (pour ne pas polluer le graphique)
+nodes <- nodes %>%  
+  mutate(name = ifelse(nodes$label !=  "[\"\"Intermediary\"\"]", " ", nodes$name))  
+
+
+net_2 <- graph_from_data_frame(d = Links, vertices = nodes, directed = TRUE) 
+
+
+#   Distribution des degrees 
+deg <- igraph::degree(net_2, mode = "all")
+deg.dist <- degree_distribution(net_2, cumulative = T, mode = "all")
+plot(x = 0:max(deg), y = 1-deg.dist, pch = 19, cex = 1.2, col = "orange", 
+     xlab = "Degree", ylab = "Cumulative Frequency")
+
+l <- layout_with_lgl(net_2) #large network layout
+totaldegreeG <- igraph::degree(net_2, mode = "all")
+
+# certains noeuds ont tellement de degré que je dois changer la taille avec deg*0.15 (parfois 0.25 selon le tirage)
+
+V(net_2)$color <- ifelse(V(net_2)$label == "[\"\"Officer\"\"]", "tomato",
+                         ifelse(V(net_2)$label == "[\"\"Intermediary\"\"]", "blue", 
+                                "gold"))
+V(net_2)$size <- totaldegreeG  
+
+plot(net_2, 
+     edge.arrow.size = 0.1,edge.color = "grey", edge.curved = .4,
+     vertex.color = V(net_2)$color, vertex.label.font = 4, vertex.label.color = "black",
+     vertex.label.cex = .7,  vertex.label = nodes$name, vertex.size = deg*0.03,vertex.label.dist = 1,
+     layout = l)
+
+
+
+```
+
+Ce graphique prouve le rôle très actif de certaines banques / cabinet d’avocats dans la création de société offshore.
+
+Dans ce réseau, la banque : « CORNER BANK OVERSEAS LIMITED » est la plus importante.
+
+
+
+4.3 )  Tirages aléatoire de 30 connexions de type “same name as”
+
+Dans ce graph non orienté (la relation est réciproque / symétrique), on obtient 4208 nœuds pour 4185 interactions.
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+#°°°°°°°°°°°°°°°°° iii) graphique non orienté - same name as °°°°°°°°°°°°°°°°°
+
+EDGES_UNDIRECTED1 <- EDGES_UNDIRECTED %>% filter(rel_type == "same_name_as")
+EDGES_UNDIRECTED1 <- EDGES_UNDIRECTED1[sample(1:nrow(EDGES_UNDIRECTED1), 30, replace = FALSE), ]
+Links_vector <- unique(c(EDGES_UNDIRECTED1$node_1, EDGES_UNDIRECTED1$node_2))
+
+Links <- subset(EDGES, node_1 %in% Links_vector) %>%  select(node_1, node_2, rel_type)
+Links <- Links %>% filter(rel_type == "same_name_as")
+
+Links_vector <- unique(c(Links$node_1, Links$node_2))
+nodes <- subset(NODES, node_id %in% Links_vector) %>% select(node_id, name, label)
+
+net_3 <- graph_from_data_frame(d = Links, vertices = nodes, directed = FALSE) 
+net_3 <- simplify(net_3)
+
+V(net_3)$color <- ifelse(V(net_3)$label == "[\"\"Officer\"\"]", "tomato",
+                         ifelse(V(net_3)$label == "[\"\"Intermediary\"\"]", "blue", 
+                                "gold"))
+
+X = as.matrix(get.adjacency(net_3))
+# le but est de retirer tous les noeuds n'ayant pas d'interactions 
+singletons <- rowSums(X) == 0           
+my_graph <- graph_from_adjacency_matrix(X[!singletons, !singletons])
+
+layout <- layout.drl(my_graph,options=list(simmer.attraction=0))
+plot(my_graph, vertex.size=2, remove.multiple = F, remove.loops = T,
+     vertex.label=NA, vertex.color=V(net_3)$color,
+     vertex.label.cex=0.5,
+     edge.arrow.size=0, edge.curved=TRUE,layout=layout)
+
+
+
+```
+
+En sélectionnant une partie des nœuds, ayant apparu avec le label « same as », nous pouvons remarquer que seuls des nœuds orange apparaissent (i.e Officer).
+
+Cela implique que les officers ont parfois la même identité mais avec des Node id diffèrent. Ce cas, a déjà été remarqué dans l’exemple ci-dessus (cf. Exemple1). Et proviennent probablement, d’une existence de plusieurs statuts au sein des « Officer ».
+
+
+
+Section II - Identification de la structure et partitionnement du réseaux
+
+Une communauté d’individus est un réseau contenant des acteurs ayant en général des intérêts communs. Cette technique de manipulation de social network nous montrera donc de manière explicite les liens caractérisant notre réseau. 
+
+A titre indicatif, nous rappelons qu’une communauté est un groupe de nœuds où le nombre de connexions à l’intérieur des clusters est plus dense qu’entre les clusters. 
+Nous retrouverons donc un partitionnement de l’ensemble des nœuds tel que  P = {C1,….Ck} .
+
+Jusqu’à présent, nous avions différencié Dirigé et Non Dirigé selon le type de relation entre les couples de nœuds. Or dans ce cadre, l’intérêt, n’est plus de s’intéresser au sens de la relation mais plutôt de mesurer s’il y a eu relation et à quelle fréquence. Tous les réseaux suivants seront donc Undirected.
+
+Dans la première sous-section, les 3 algorithmes de détection de communauté sous condition de maximisation de la modularité testés seront : « cluster_edge_betweenness » de Girvan & Newman, « cluster_fast_greedy» de Newman ainsi que « cluster_louvain ».
+Puis dans la seconde, d'autres types algorithmes de clustering seront implémenté.
+
+1 - Communauté sous condition de régularité
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+
+# °°°°°°°°°°°°°°°°° CONSTRUCTION DU TIRAGE ALEATOIRE - preparations °°°°°°°°°°°°°°°°°
+
+EDGES_1 <- EDGES %>% filter(rel_type == "same_name_as")
+EDGES_1 <- EDGES_1[sample(1:nrow(EDGES_1), 10, replace = FALSE), ]
+EDGES_2 <- EDGES %>% filter(rel_type == "officer_of")
+EDGES_2 <- EDGES_2[sample(1:nrow(EDGES_2), 100, replace = FALSE), ]
+EDGES_3 <- EDGES %>% filter(rel_type == "intermediary_of")
+EDGES_3 <- EDGES_3[sample(1:nrow(EDGES_3), 800, replace = FALSE), ]
+
+Links <- rbind(EDGES_1,EDGES_2,EDGES_3) %>% select(node_1, node_2, rel_type)
+
+# reviens a utilisé la fonction degree de igraph 
+# jamais de >1 pour node 2
+degree <- Links %>% 
+  group_by(node_1) %>% 
+  summarise(NB = n())
+
+Links <- merge(x = Links ,y = degree, by="node_1")
+Links <- Links %>% filter(Links$NB > 1)
+
+Links_vector <- unique(c(Links$node_1, Links$node_2))
+nodes <- subset(NODES, node_id %in% Links_vector) %>% select(node_id, name, label)
+
+# ici je cherche a garder le noms des noms qui ont uniquement une importance donc ici je fixe à au moins 10 relations
+nodes <- merge(x = nodes ,y = degree, by.x ="node_id", by.y = "node_1",all.x = TRUE)
+nodes$name[nodes$NB < 15 | is.na(nodes$NB)] <- NA
+
+nodes_vector <-  unique(c(nodes$node_id))
+Links <- subset(Links, node_1 %in% nodes_vector) %>% select(node_1, node_2, rel_type)
+Links <- subset(Links, node_2 %in% nodes_vector) %>% select(node_1, node_2, rel_type)
+
+
+net_4 <- graph.data.frame(Links, directed = FALSE, vertices = nodes)
+net_4 <- as.undirected(graph = net_4, mode = "collapse", edge.attr.comb = sum)
+summary(net_4)
+
+# composante connexes
+#clusters(net_4)  
+
+# degree
+degIn <- strength(net_4, mode = "in", weights = E(net_4)$NB)
+degOut <- strength(net_4, mode = "out", weights = E(net_4)$NB)
+hist(degIn, col = "firebrick", border = "white")
+plot(degIn, degOut, pch = 20)
+abline(a = 0, b = 1, col = "red")
+
+# calcul du nombre de degree puis merger avec la table nodes pour faire une selection des noeuds interessant
+totaldegreeG <- igraph::degree(net_4, mode = "all")
+
+# matrice d'adjacence
+X = as.matrix(get.adjacency(net_4)) 
+
+
+E(net_4)$color <- ifelse(E(net_4)$rel_type == "intermediary_of", "tomato",
+                         ifelse(E(net_4)$rel_type == "officer_of", "blue", 
+                                "tomato"))
+
+```
+
+
+2.1 Girvan et Newman 
+
+ Ayant un réseau trop large, nous n’utiliserons pas un sampling des nœuds aléatoire comme ci-dessus mais un tirage conditionnel par type de relations ayant les proportions suivantes : 
+ 
+	800 connexions « intermediary of »
+	100 connexions « officer of »
+	10 connexions « same name as »
+
+Cette technique est généralement utilisée pour agréger des réseaux sociaux de grande ampleur (Exemple : Relations sur Facebook). Il permet de garder la structure originale du réseau en minimisant le caractère aléatoire des tirages. Cependant, un biais est conservé dans cette analyse en sous-estimant les degrés, en effet nous étudions une fraction du réseau uniquement.
+
+Pour finir, afin de gagner en visibilité, seuls les noms des acteurs ayant plus de 15 connexions apparaitront, et seuls les nœuds de plus d’une connexion sont conservés.
+
+La distribution des dégrées nous montre que seule une infime fraction de nœuds ont plus de 2 relations.
+
+
+Girvan et Newman ont construit leur algorithme de détection de communauté sur une méthode hiérarchique consistant à retirer une arête successivement l’une après l’autre. Puis de revenir en arrière et observer la modularité maximale.
+
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+# °°°°°°°°°°°°°°°°° ALGO 1 : cluster_edge_betweenness - Girvan & Newman  °°°°°°°°°°°°°°°°°
+
+betweenClus <- cluster_edge_betweenness(net_4,directed=FALSE, edge.betweenness = TRUE,
+                              merges = TRUE,bridges=TRUE,modularity=TRUE)
+
+
+gplot(X, gmode="graph", vertex.col= betweenClus$membership, edge.col = E(net_4)$color,
+        edge.curved = .4, vertex.label.dist = 1, displaylabels = TRUE, boxed.labels==TRUE, label.pos = 10, label.col = "black",
+        vertex.size =0.4, diag = FALSE, vertex.size = sizes(betweenClus), label.pad = 10)
+
+```
+
+ Seuls des arêtes de couleur rouge apparaissent dans ce réseau, ce qui montre à nouveau la place essentielle des intermédiaires. Le réseau est similaire à un « schéma en étoile » avec un acteur central sur chacune des communautés.
+ 
+Par ailleurs, pour la majeure partie des communautés, il n’y a même pas un lien commun entre deux communautés. On peut donc imaginer que ce sont des liens très privés, en effet, les acteurs souhaitent garder ce patrimoine inconnu et donc interagissent en cercle fermé avec leur administrateur.
+
+
+2.2 glouton 
+
+Pour utiliser ce second algorithme, j’utilise les nœuds de 1000 interactions de type « same adress as » & « same name as ».
+
+Cet algorithme utilise la méthode inverse, puisqu'au départ chaque nœud est présent dans un cluster distinct, puis toutes les combinaisons de rassemblement seront testées, la fusion a lieu si la modularité augmente.
+
+
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+# °°°°°°°°°°°°°°°°° ALGO 2 : cluster_fast_greedy °°°°°°°°°°°°°°°°°
+
+Links <- EDGES %>% filter(rel_type == "same_address_as" | rel_type == "same_name_as") %>% 
+                   select(node_1, node_2, rel_type)
+Links <- Links[sample(1:nrow(Links), 1000, replace = FALSE), ]
+
+Links_vector <- unique(c(Links$node_1, Links$node_2))
+nodes <- subset(NODES, node_id %in% Links_vector) %>% select(node_id, name, label)
+
+net_5 <- graph.data.frame(Links, directed = FALSE, vertices = nodes)
+
+X = as.matrix(get.adjacency(net_5)) 
+totaldegreeG <- igraph::degree(net_5, mode = "all")
+
+
+greedyClus <- cluster_fast_greedy(net_5,modularity=TRUE)
+
+gplot(X, gmode="graph", vertex.col =  greedyClus$membership, edge.col = "grey",
+      edge.curved = .4, vertex.label.dist = 1, displaylabels = FALSE, label.col = "black",
+      vertex.size =0.4, diag = FALSE, vertex.size = totaldegreeG, label.pad = 5)
+
+plot(greedyClus$modularity)   
+
+```
+
+Il est à noter qu’il existe davantage de petite communauté isolée (de 1 ou 2 nœuds), cependant, à nouveau, l’on remarque ce schéma en étoile qui régit l’ensemble de notre réseau.
+
+
+2.3 Louvain
+
+
+L’Université de Louvain a développé une approche similaire à l’algorithme précédent car il s’agit aussi d’une fusion lorsque la modularité augmente.
+
+On représente donc les mêmes nœuds présents dans la section 2.2 tout en changeant la méthode de construction des communautés.
+
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+# °°°°°°°°°°°°°°°°° ALGO 3 : cluster_louvain °°°°°°°°°°°°°°°°°
+
+louvainClus <- cluster_louvain(net_5, weights = NULL)
+
+gplot(X, gmode="graph", vertex.col =  louvainClus$membership, edge.col = "grey",
+      edge.curved = .4, vertex.label.dist = 1, displaylabels = FALSE, label.col = "black",
+      vertex.size =0.4, diag = FALSE, vertex.size = totaldegreeG, label.pad = 5)
+```
+
+
+2 - Clustering hors modularité
+
+  Dans cette sous-section, l’angle utilisé pour réaliser le clustering est totalement différents. En effet, le clustering sera construit sur les diverses attributs disponibles et également sur le nombre de relations s’opposant aux interactions et donc au coté relationnels pour la construction des communautés.
+
+Ma table initiale sera composée du noeuds, de son statut ainsi que son nombre de dégrée (calculer manuellement à partir de la table EDGES).
+
+Pour ne pas biaiser l’analyse, on reste en sous-graph, c’est-à-dire avec un tirage aléatoire de nœuds. L’avantage des algorithmes tel que les kmeans ou CAH est qu’ils sont supportés pour des données massives sans avoir une machine exceptionnelle. Cependant, avec les objets de type « Social Network », les analyses ont été contraintes à un maximum de 10.000 nœuds en moyenne. 
+
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+
+# PREPARATION POUR LES KMEANS 
+
+colnames(ENTITY)[5] <- "countries"
+
+# rajout du pays
+NODES <- rbind(ENTITY[,c(1,2,4,5)], OFFICER[,c(1,4,6,3)],
+               INTERMED[,c(1,4,6,3)], ADDRESS[,c(1,4,6,3)])
+
+
+# calcul du nombre de degré manuellement 
+deg_node_1 <- EDGES %>% group_by(node_1) %>% summarize(n = n())
+deg_node_2 <- EDGES %>% group_by(node_2) %>% summarize(n = n())
+colnames(deg_node_2)[1] <- "node_1"
+deg <- rbind(deg_node_1,deg_node_2)
+deg <- deg %>% group_by(node_1) %>% summarize(n = sum(n))
+
+NODES <- merge(x = NODES, y = deg, by.x = "node_id", by.y = "node_1")
+
+```
+
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+NODES1 <- NODES[sample(1:nrow(NODES), 30000, replace = FALSE), ]
+
+NODES1$countries <- replace(NODES1$countries,is.na(NODES1$countries),0)
+NODES2 <- NODES1 %>% select(countries,n,label)
+
+
+NODES2[NODES2 == "[\"\"Entity\"\"]"] <- 1
+NODES2[NODES2 == "[\"\"Address\"\"]"] <- 2
+NODES2[NODES2 == "[\"\"Officer\"\"]"] <- 3
+NODES2[NODES2 == "[\"\"Intermediary\"\"]"] <- 4
+
+NODES2[NODES2 == "Bahamas"] <- 1
+NODES2[NODES2 != 1] <- 0
+
+
+# choix du k ideal
+rownames(NODES2) <- NODES1$node_id
+
+library(factoextra)
+
+optimal<-c()
+for(i in 1:6){
+  set.seed(1)
+  k<-kmeans(NODES2, i)
+  optimal[i]<-k$tot.withinss
+}
+plot(optimal)
+
+NODES2_km <- kmeans(NODES2,centers = 4, nstart = 1, iter.max = 50)
+
+```
+
+On observe deux nombres de cluster idéaux candidats selon le critère du coude : 2 et 4.
+On partitionne donc les nœuds en 4 groupes.
+
+
+```{r ,echo = FALSE,warning = FALSE, fig.align="center" }
+library(cluster)
+clusplot(NODES2, NODES2_km$cluster, main=' Cluster representation',
+         color=TRUE, shade=TRUE,
+         labels=2, lines=0)
+```
+
+
+
+CONCLUSIONS : 
+
+Pour conclure, les acteurs centraux sont les intermédiaires qui mandatent et régissent les entités.
+
+Parmi ces acteurs, les noms CREDIT SUISSE, MOSSACK FONSECA ou encore MMG sont mis en évidence. Par ailleurs, on pourrait se demander si l’intermédiaire, l’entité et l’officer, ne sont pas en réalité qu’une seule et même personne au travers de montage complexe. En effet, parfois, nous retrouvons pour ces 3 fonctions, des noms extrêmement similaires.
+
+La structure récurrente est le schéma en étoile (similaire à un réseau d’influenceurs) avec un nœud central qui régit le réseau avec de fortes probabilités de connexions, mais aucune connexion entre les nœuds « d’influencées ».
+
+Il aurait pu être intéressant de comparer les différentes méthodes de composition des communautés avec un algorithme de clustering de type Stochastic Bloc Model (SBM) basé sur un dérivé de la vraisemblance. De plus, dans le cadre de la confidentialité, seul peut d’attributs qualitatifs sont disponibles ce qui limite l’analyse.
+
+
